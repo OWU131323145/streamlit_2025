@@ -2,6 +2,9 @@ import streamlit as st
 import requests
 import time
 from datetime import datetime
+from dotenv import load_dotenv
+import os
+
 
 # ----- 設定 -----
 st.set_page_config(page_title="朝の準備サポート", page_icon="🌅")
@@ -13,7 +16,8 @@ st.header("☁️ 今日の天気 & 服装提案")
 
 city = st.text_input("都市名を入力してください（例: Tokyo, Osaka, Sapporo）")
 
-api_key = "ca92f87ae7a7ac84de62ea177352f028"  
+load_dotenv()
+api_key = os.getenv("SECRET_API")  
 
 if st.button("天気を確認！"):
     if city.strip() == "":
