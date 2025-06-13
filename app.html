@@ -1,1 +1,366 @@
 
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script src="https://unpkg.com/obniz/obniz.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+      #uv-value { font-size: 24px; font-weight: bold; }
+      canvas { max-width: 100%; height: 200px; }
+    </style>
+    <title>UVモニター</title>
+  </head>
+  <body>
+    <h1>UVモニター</h1>
+
+    <div>
+      <label>地名: </label>
+      <input type="text" id="location" placeholder="例: Tokyo" />
+      <button onclick="startAppByLocation()">地名で検索</button>
+      <button onclick="startAppByGeo()">現在位置で調べる</button>
+      <label>都市別ログ表示:</label>
+      <select id="locationFilter" onchange="onLocationChange()"></select>
+      <button onclick="deleteLogsForLocation()">この都市のログを削除</button>
+    </div>
+
+    <canvas id="uv-chart"></canvas>
+
+    <div id="uv-index">UV指数: <span id="uv-value">--</span></div>
+    <div id="weather">天気: --</div>
+
+    <script>
+      const OBNIZ_ID = "XXXX-XXXX"; 
+      const OPENUV_API_KEY = ${{ secrets.uv_key }};
+      const OPENWEATHER_API_KEY = ${{ secrets.weather_key }};
+
+      const LED_COUNT = 15;
+      let obniz;
+      let leds;
+
+      // ログはlocalStorageからロード、配列として保持
+      let uvLogs = JSON.parse(localStorage.getItem("uvLogs") || "[]");
+
+      // Chart.jsのグローバルインスタンス
+      let chartInstance = null;
+
+      // Obniz接続初期化
+      async function initObniz() {
+        if (!obniz) {
+          obniz = new Obniz(OBNIZ_ID);
+          await obniz.connectWait();
+          leds = obniz.wired("WS2812B", { din: 26 });
+        }
+      }
+
+      // 位置情報から緯度経度を取得（OpenStreetMapのNominatim API）
+      async function geocodeLocation(location) {
+        const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(location)}`);
+        const data = await res.json();
+        if (!data.length) throw new Error("地名が見つかりません");
+        return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) };
+      }
+
+      // 現在位置取得
+      function getCurrentPosition() {
+        return new Promise((resolve, reject) => {
+          navigator.geolocation.getCurrentPosition(
+            pos => resolve({ lat: pos.coords.latitude, lon: pos.coords.longitude }),
+            err => reject(err)
+          );
+        });
+      }
+
+      // OpenUV APIからUV指数取得
+      async function fetchUV(lat, lon) {
+        const res = await fetch(`https://api.openuv.io/api/v1/uv?lat=${lat}&lng=${lon}`, {
+          headers: { "x-access-token": ${{ secrets.uv_key }} }
+        });
+        const data = await res.json();
+        if (!data.result || data.result.uv === undefined) throw new Error("UVデータ取得失敗");
+        return data.result.uv;
+      }
+
+      // OpenWeather APIから天気情報取得
+      async function fetchWeather(lat, lon) {
+        const res = await fetch(`https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lon}&appid=${OPENWEATHER_API_KEY}&units=metric&lang=ja`);
+        const data = await res.json();
+        if (!data.weather || !data.weather[0]) throw new Error("天気データ取得失敗");
+        return data.weather[0].description;
+      }
+
+      // LED表示（HSVでUV指数に応じて色数設定）
+      function showLED(uv) {
+        if (!leds) return;
+        const ledsToLight = Math.min(Math.ceil(uv * 1.5), LED_COUNT);
+        const ledColors = [];
+        for (let i = 0; i < LED_COUNT; i++) {
+          if (i < ledsToLight) {
+            const hue = Math.min(uv * 36, 359); // UVに比例した色相
+            ledColors.push([hue, 1.0, 0.6]);
+          } else {
+            ledColors.push([0, 0, 0]);
+          }
+        }
+        leds.hsvs(ledColors);
+      }
+
+      // UVと天気を画面表示更新
+      function updateDisplay(uv, weather) {
+        document.getElementById("uv-value").textContent = uv.toFixed(1);
+        document.getElementById("weather").textContent = `天気: ${weather}`;
+      }
+
+      // ログに記録
+      function logUV(uv, weather, location) {
+        const log = { timestamp: new Date().toISOString(), uv, weather, location };
+        uvLogs.push(log);
+        localStorage.setItem("uvLogs", JSON.stringify(uvLogs));
+      }
+
+      // ロケーションリストをセレクトにセット 先頭に全都市比較
+      function updateLocationSelect() {
+        const select = document.getElementById("locationFilter");
+        select.innerHTML = "";
+
+        // ログから地名を抽出
+        const uniqueLocations = [...new Set(uvLogs.map(log => log.location))].sort();
+
+        // 「全都市（比較）」を追加
+        const allOption = document.createElement("option");
+        allOption.value = "ALL";
+        allOption.textContent = "全都市（比較）";
+        select.appendChild(allOption);
+
+        uniqueLocations.forEach(loc => {
+          const option = document.createElement("option");
+          option.value = loc;
+          option.textContent = loc;
+          select.appendChild(option);
+        });
+      }
+
+      // グラフ描画更新
+      function updateChart(locationFilter = "ALL") {
+        const logs = uvLogs;
+
+        // フィルタ処理
+        let filteredLogs;
+        if (locationFilter === "ALL") {
+          filteredLogs = logs;
+        } else {
+          filteredLogs = logs.filter(log => log.location === locationFilter);
+        }
+
+        // 表示件数制限 20件
+        const slicedLogs = filteredLogs.slice(-20);
+
+        // 時刻ラベルとUVデータ配列作成
+        const labels = slicedLogs.map(log => new Date(log.timestamp).toLocaleTimeString());
+        const datasets = [];
+
+        if (locationFilter === "ALL") 
+          const logsByLocation = {};
+          logs.forEach(log => {
+            if (!logsByLocation[log.location]) logsByLocation[log.location] = [];
+            logsByLocation[log.location].push(log);
+          });
+
+        
+          const colors = [
+            "red", "blue", "green", "orange", "purple", "brown", "cyan", "magenta", "lime", "navy"
+          ];
+
+          let colorIndex = 0;
+          for (const loc in logsByLocation) {
+            // その都市の最新20件とラベル取得
+            const locLogs = logsByLocation[loc].slice(-20);
+            const locLabels = locLogs.map(log => new Date(log.timestamp).toLocaleTimeString());
+            const locData = locLogs.map(log => log.uv);
+
+            datasets.push({
+              label: loc,
+              data: locData,
+              borderColor: colors[colorIndex % colors.length],
+              fill: false,
+              tension: 0.1,
+              spanGaps: true,
+            });
+            colorIndex++;
+          }
+
+          // ラベルを全体の最新20件の時間に揃える
+          const allLabelsSet = new Set();
+          logs.slice(-20).forEach(log => {
+            allLabelsSet.add(new Date(log.timestamp).toLocaleTimeString());
+          });
+         
+          var finalLabels = Array.from(allLabelsSet);
+          
+        } else {
+         
+          datasets.push({
+            label: `${locationFilter}のUV指数`,
+            data: slicedLogs.map(log => log.uv),
+            borderColor: "orange",
+            fill: false,
+            tension: 0.1,
+            spanGaps: true,
+          });
+          var finalLabels = labels;
+        }
+
+        // canvas取得
+        const ctx = document.getElementById("uv-chart").getContext("2d");
+
+        // 既存グラフを破棄
+        if (chartInstance) chartInstance.destroy();
+
+        // 新規チャート作成
+        chartInstance = new Chart(ctx, {
+          type: "line",
+          data: {
+            labels: finalLabels,
+            datasets: datasets
+          },
+          options: {
+            responsive: true,
+            plugins: {
+              legend: { display: true }
+            },
+            scales: {
+              y: { min: 0, max: 12 }
+            }
+          }
+        });
+
+        // セレクトメニューを更新し選択中を保持
+        updateLocationSelect();
+        document.getElementById("locationFilter").value = locationFilter;
+      }
+
+      // セレクト変更時の処理
+      function onLocationChange() {
+        const selected = document.getElementById("locationFilter").value;
+        updateChart(selected);
+      }
+
+      // 選択中都市のログ削除
+      function deleteLogsForLocation() {
+        const selected = document.getElementById("locationFilter").value;
+        if (!selected) return alert("都市を選択してください");
+        if (selected === "ALL") return alert("全都市比較は削除できません");
+
+        if (!confirm(`本当に「${selected}」のログを削除しますか？`)) return;
+
+        uvLogs = uvLogs.filter(log => log.location !== selected);
+        localStorage.setItem("uvLogs", JSON.stringify(uvLogs));
+
+        updateLocationSelect();
+        if (uvLogs.length > 0) {
+          updateChart("ALL");
+        } else {
+          if (chartInstance) chartInstance.destroy();
+          document.getElementById("uv-value").textContent = "--";
+          document.getElementById("weather").textContent = "天気: --";
+          document.getElementById("locationFilter").innerHTML = "";
+        }
+      }
+
+      // 指定地名から開始
+      async function startAppByLocation() {
+        try {
+          const location = document.getElementById("location").value.trim();
+          if (!location) return alert("地名を入力してください");
+
+          const { lat, lon } = await geocodeLocation(location);
+          await initObniz();
+          const uv = await fetchUV(lat, lon);
+          const weather = await fetchWeather(lat, lon);
+          
+          showLEDwithBlink(uv);
+          updateDisplay(uv, weather);
+          logUV(uv, weather, location);
+          showLED(uv);
+          updateChart("ALL");
+        } catch (e) {
+          alert("エラー: " + e.message);
+        }
+      }
+
+      // 現在地から開始
+      async function startAppByGeo() {
+        try {
+          const pos = await getCurrentPosition();
+          const location = `(${pos.lat.toFixed(2)},${pos.lon.toFixed(2)})`;
+          await initObniz();
+          const uv = await fetchUV(pos.lat, pos.lon);
+          const weather = await fetchWeather(pos.lat, pos.lon);
+          
+          showLEDwithBlink(uv);
+          updateDisplay(uv, weather);
+          logUV(uv, weather, location);
+          showLED(uv);
+          updateChart("ALL");
+        } catch (e) {
+          alert("エラー: " + e.message);
+        }
+      }
+
+      // 起動時の初期設定
+      window.onload = () => {
+        updateLocationSelect();
+        updateChart("ALL");
+      };
+
+      let blinkInterval = null;
+
+// 差分LED点滅処理（増減部分だけ点滅）
+function blinkDiffLEDs() {
+  if (uvLogs.length < 2) return; // 最新2件必要
+
+  const lastUV = uvLogs[uvLogs.length - 1].uv;
+  const prevUV = uvLogs[uvLogs.length - 2].uv;
+
+  // UV→点灯LED数に変換
+  const lastCount = Math.min(Math.ceil(lastUV * 1.5), LED_COUNT);
+  const prevCount = Math.min(Math.ceil(prevUV * 1.5), LED_COUNT);
+
+
+  if (blinkInterval) clearInterval(blinkInterval);
+
+  let isOn = false;
+  blinkInterval = setInterval(() => {
+    const ledColors = [];
+
+    for (let i = 0; i < LED_COUNT; i++) {
+      if (prevCount < lastCount && i >= prevCount && i < lastCount) {
+        // 増加LED部分
+        ledColors.push(isOn ? [0, 1, 1] : [0, 0, 0]);
+      } else if (prevCount > lastCount && i >= lastCount && i < prevCount) {
+        // 減少LED部分
+        ledColors.push(isOn ? [240, 1, 1] : [0, 0, 0]);
+      } else if (i < Math.min(lastCount, prevCount)) {
+        // 増減していない共通点灯部分
+        ledColors.push([120, 1, 0.6]); // 緑で常時点灯
+      } else {
+        // 消灯
+        ledColors.push([0, 0, 0]);
+      }
+    }
+    leds.hsvs(ledColors);
+    isOn = !isOn;
+  }, 500);
+}
+
+function showLEDwithBlink(uv) {
+  showLED(uv);
+  blinkDiffLEDs();
+}
+
+
+    </script>
+  </body>
+</html>
+
