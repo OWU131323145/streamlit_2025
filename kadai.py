@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import time
 from datetime import datetime
+import os
 
 
 # ----- 設定 -----
