@@ -14,7 +14,7 @@ st.header("☁️ 今日の天気 & 服装提案")
 
 city = st.text_input("都市名を入力してください（例: Tokyo, Osaka, Sapporo）")
 
-api_key = "SECRET_API"
+api_key = os.getenv("SECRET_API")
 
 if st.button("天気を確認！"):
     if city.strip() == "":
